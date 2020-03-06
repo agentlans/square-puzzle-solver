@@ -1,0 +1,270 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- $0 "$@"
+|#
+(progn ;;init forms
+  (ros:ensure-asdf)
+  #+quicklisp(ql:quickload '(:alexandria :str) :silent t)
+  )
+
+(defpackage :ros.script.square-puzzle.3792426430
+  (:use :cl :alexandria))
+(in-package :ros.script.square-puzzle.3792426430)
+
+(defun make-puzzle (n)
+  "Returns a n x n square puzzle."
+  (let ((puz (make-array (list n n) :element-type 'integer)))
+    (loop for i from 0 to (- n 1)
+       do (loop for j from 0 to (- n 1)
+	     do (setf (aref puz i j)
+		      (+ (* i n) j))))
+    puz))
+
+(defun puzzle-dim (puz)
+  "Returns the dimension n of a n x n puzzle."
+  (car (array-dimensions puz)))
+
+(defun find-zero (puz)
+  "Return index of the 0 tile."
+  (declare (optimize (speed 3)))
+  (let ((n (puzzle-dim puz)))
+    (loop for i from 0 to (* n n)
+       if (= (row-major-aref puz i) 0)
+       return i)))
+
+(defun relative-position (n index delta-i delta-j)
+  "Return index of a position relative to another."
+  (declare (optimize (speed 3)))
+  (flet ((valid? (x)
+	   (and (<= 0 x) (< x n))))
+    (let ((i2 (+ (floor (/ index n)) delta-i))
+	  (j2 (+ (mod index n) delta-j)))
+      (if (or (not (valid? i2))
+	      (not (valid? j2)))
+	  NIL
+	  (+ (* i2 n) j2)))))
+;; (relative-position 4 0 1 1)
+;; index 0 is (0, 0). (1, 1) is index 5 on a 4 x 4 board.
+
+(defun swap-tiles (puz index1 index2)
+  "Swaps the tiles at index1 and index2."
+  (flet ((ref (x) (row-major-aref puz x)))
+    (let ((val (ref index1)))
+      (setf (row-major-aref puz index1) (ref index2))
+      (setf (row-major-aref puz index2) val))))
+;; (defparameter *puz* (make-puzzle 4))
+;; (swap-tiles *puz* 0 5)
+
+(defun next-states (puz)
+  "Returns a list of board states after a valid move."
+  (let ((z (find-zero puz))
+	(n (puzzle-dim puz)))
+    (loop for (delta-i delta-j) in
+	 '((-1 0) (1 0) (0 -1) (0 1))
+       for new-p = (relative-position n z delta-i delta-j)
+       if new-p collect
+	 (let ((new-puz (alexandria:copy-array puz)))
+	   (swap-tiles new-puz z new-p)
+	   new-puz))))
+
+(defun l1-distance (c1 c2)
+  "Returns the Manhattan distance between two coordinates."
+  (declare (optimize (speed 3)))
+  (+ (abs (- (car c1) (car c2)))
+     (abs (- (cdr c1) (cdr c2)))))
+
+(defun distance (puz)
+  "Returns the minimum number of moves to solve the puzzle."
+  (/ (let ((n (puzzle-dim puz)))
+       (loop for i from 0 to (- n 1) sum
+	    (loop for j from 0 to (- n 1)
+	       for val = (aref puz i j)
+	       sum (l1-distance (cons i j) ; Actual position
+				(cons (floor (/ val n)) ; solved position
+				      (mod val n))))))
+     2)) ; Divide by 2 because two tiles have to be swapped and it's symmetrical
+
+(defun random-select (seq)
+  "Returns a random element from seq."
+  (elt seq (random (length seq))))
+
+(defun shuffle-puzzle (n moves)
+  "Returns a shuffled puzzle of size n x n."
+  (let ((puz (make-puzzle n)))
+    (loop for i from 1 to moves
+       do (setf puz (random-select
+		     (next-states puz))))
+    puz))
+;; (shuffle 4 100)
+
+(defun retrace-path (end parent)
+  "Returns the path to get from the start element (whose parent is T)
+to the end element."
+  (let ((v end)
+	(path (list end)))
+    (loop do
+	 (progn
+	   (setf v (gethash v parent))
+	   (setf path (cons v path)))
+       until (equalp v T))
+    (cdr path)))
+
+(defun prune (puz-list)
+  "Filters the list of puzzle positions so that the top 100 closest positions are kept."
+  (subseq 
+   (sort puz-list (lambda (p1 p2)
+		    (< (distance p1) (distance p2))))
+   0 (min (length puz-list) 200)))
+
+(defun travelled-paths (S parent)
+  "Returns a hash table whose keys are states that lead to the states in S.
+parent is a hash table mapping states to their parent states."
+  (let ((h (make-hash-table :test #'equalp)))
+    (loop for v in S do
+	 (loop for x in (retrace-path v parent) do
+	      (setf (gethash x h) T)))
+    h))
+
+(defun remove-untravelled (h keys-to-keep)
+  "Removes keys from h that don't appear in the set of keys that we want to keep."
+  (loop for k being the hash-keys of h
+     if (not (gethash k keys-to-keep))
+     do (remhash k h)))
+
+(defun dfs (start goal? children)
+  (declare (optimize (speed 3)))
+  (let ((S (list start))
+	(v NIL)
+	(visited (make-hash-table :test #'equalp))
+	(parent (make-hash-table :test #'equalp))
+	(counter 0))
+    (setf (gethash start parent) T)
+    (loop do
+	 (progn
+	   (setf v (pop S))
+	   (when (not (gethash v visited))
+	     (setf (gethash v visited) T)
+	     (loop for c in (funcall children v)
+		do (progn
+		     (when (not (gethash c parent))
+		       (setf (gethash c parent) v))
+		     (push c S))))
+	   (incf counter)
+	   (setf S (prune S))
+	   (when (= (mod counter 100) 0)
+	     ;; Remove states that aren't close to the solution
+	     ;; Remove unvisited states to save memory
+	     (let ((h (travelled-paths S parent)))
+	       (remove-untravelled visited h)
+	       (remove-untravelled parent h))))
+       until (or (= (length S) 0)
+		 (funcall goal? v)))
+    (if (= (length S) 0)
+	NIL ; Fail
+	(retrace-path v parent))))
+
+(defun make-hash ()
+  (make-hash-table :test #'equalp))
+
+(defun depth-limited-search (start goal? children max-depth)
+  "Depth first search up to and including maximum depth.
+Returns the path from start to solution vertex."
+  (declare (optimize (speed 3)))
+  (let ((S (list start))
+	(v nil)
+	(visited (make-hash))
+	(parent (make-hash))
+	(depth (make-hash))
+	(counter 0))
+    (setf (gethash start depth) 0)
+    (setf (gethash start parent) T)
+    (loop do
+	 (progn
+	   (setf v (pop S))
+	   (incf counter)
+	   ;; If we reached the goal then return path
+	   (when (funcall goal? v)
+	     (return (retrace-path v parent)))
+	   (when (and (not (gethash v visited))
+		      (< (gethash v depth) max-depth))
+	     ;; Mark vertex as visited
+	     (setf (gethash v visited) T)
+	     (let ((c-depth (+ (gethash v depth) 1)))
+	       (loop for c in (funcall children v)
+		  do (progn
+		       ;; Set parent of child vertex and depth of child vertex
+		       (setf (gethash c depth) c-depth)
+		       (when (not (gethash c parent))
+			 (setf (gethash c parent) v))
+		       ;; Put child vertex back into stack.
+		       (push c S))))))
+	   ;;(when (= (mod counter 100) 0)
+	     ;;(setf S (prune S))))
+       until (= (length S) 0))))
+
+(defun iterative-deepening-search (start goal? children)
+  "Search for a goal vertex using progressively deeper searches.
+Returns a path from start to goal vertex if found."
+  (loop for depth from 0
+     for v = (depth-limited-search start goal? children depth)
+     do (progn
+	  (format t "Searching depth ~d~%" depth)
+	  (finish-output))
+     if v return v))
+
+
+(defun solve (puz)
+  "Returns a series of moves that can change puzzle into solved state."
+  (dfs
+   puz
+   (lambda (p) (= (distance p) 0))
+   (lambda (p)
+     (sort (next-states p)
+	   (lambda (p1 p2)
+	     (> (distance p1) (distance p2)))))))
+
+(defun print-puzzle (puz)
+  "Prints representation of puzzle to output."
+  (let ((n (puzzle-dim puz)))
+    (loop for i from 0 to (- n 1) do
+	 (loop for j from 0 to (- n 1) do
+	      (let ((val (aref puz i j)))
+		(if (= val 0)
+		    (princ " _")
+		    (format t "~2d" val))
+		    ;;(princ val))
+		(princ " "))
+	    finally (terpri)))
+    (terpri)))
+
+(defun open-square-matrix (filename)
+  "Opens a file containing integer square matrix and returns it as an array."
+  (let* ((data
+	  (mapcar (lambda (x)
+		    (mapcar #'parse-integer
+			    (str:split-omit-nulls "," x)))
+		  (str:lines (str:trim (alexandria:read-file-into-string filename)))))
+	 (n (length data)))
+    (when (not (loop for row in data
+		  always (= (length row) n)))
+      (error "Not square matrix."))
+    (make-array (list n n) :initial-contents data)))
+
+(defun main (x &rest argv)
+  (declare (ignorable argv))
+  ;; First argument can either be an integer or a file name.
+  ;; If it's an integer n, then the program randomly shuffles a n x n puzzle and solves it.
+  ;; If it's a file name, then the program loads the matrix into a puzzle and solves it.
+  (let ((first-arg (parse-integer x :junk-allowed t)))
+    (let ((solution
+	   (if first-arg
+	       (solve (shuffle-puzzle first-arg 100))
+	       (solve (open-square-matrix x)))))
+      (progn
+	(loop for p in solution do (print-puzzle p))
+	(format t "Number of moves: ~d" (- (length solution) 1))))))
+
+#|  (let ((soln (solve (shuffle-puzzle (parse-integer n) 100))))
+(loop for p in soln do (print-puzzle p))))|#
+;;; vim: set ft=lisp lisp:
